@@ -3,8 +3,7 @@
 use std::fmt::Write;
 
 use anyhow::{Context, Result, bail};
-use rung_core::State;
-use rung_core::stack::StackBranch;
+use rung_core::{State, stack::StackBranch};
 use rung_git::Repository;
 use rung_github::{
     Auth, CreateComment, CreatePullRequest, GitHubClient, UpdateComment, UpdatePullRequest,
@@ -20,13 +19,14 @@ struct SubmitOutput {
     prs_updated: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     branches: Vec<BranchSubmitInfo>,
+    dry_run: bool,
 }
 
 /// Information about a submitted branch.
 #[derive(Debug, Serialize)]
 struct BranchSubmitInfo {
     branch: String,
-    pr_number: u64,
+    pr_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pr_url: Option<String>,
     action: SubmitAction,
@@ -40,9 +40,12 @@ enum SubmitAction {
 }
 
 /// Configuration options for the submit command.
+#[allow(clippy::struct_excessive_bools)]
 struct SubmitConfig<'a> {
     /// Output as JSON.
     json: bool,
+    /// Don't actually update or create PRs, just show what would be done.
+    dry_run: bool,
     /// Create PRs as drafts.
     draft: bool,
     /// Force push branches.
@@ -62,7 +65,14 @@ struct GitHubContext<'a> {
 }
 
 /// Run the submit command.
-pub fn run(json: bool, draft: bool, force: bool, custom_title: Option<&str>) -> Result<()> {
+#[allow(clippy::fn_params_excessive_bools)]
+pub fn run(
+    json: bool,
+    dry_run: bool,
+    draft: bool,
+    force: bool,
+    custom_title: Option<&str>,
+) -> Result<()> {
     let (repo, state, mut stack) = setup_submit()?;
 
     if stack.is_empty() {
@@ -71,6 +81,7 @@ pub fn run(json: bool, draft: bool, force: bool, custom_title: Option<&str>) -> 
                 prs_created: 0,
                 prs_updated: 0,
                 branches: vec![],
+                dry_run,
             });
         }
         output::info("No branches in stack - nothing to submit");
@@ -79,6 +90,7 @@ pub fn run(json: bool, draft: bool, force: bool, custom_title: Option<&str>) -> 
 
     let config = SubmitConfig {
         json,
+        dry_run,
         draft,
         force,
         custom_title,
@@ -86,7 +98,7 @@ pub fn run(json: bool, draft: bool, force: bool, custom_title: Option<&str>) -> 
     };
 
     let (owner, repo_name) = get_remote_info(&repo)?;
-    if !json {
+    if !json && !dry_run {
         output::info(&format!("Submitting to {owner}/{repo_name}..."));
     }
 
@@ -102,17 +114,27 @@ pub fn run(json: bool, draft: bool, force: bool, custom_title: Option<&str>) -> 
 
     let (created, updated, branch_infos) = process_branches(&repo, &gh, &mut stack, &config)?;
 
-    state.save_stack(&stack)?;
-
-    // Update stack comments on all PRs
-    update_stack_comments(&gh, &stack.branches, json)?;
+    if !dry_run {
+        state.save_stack(&stack)?;
+        // Update stack comments on all PRs
+        update_stack_comments(&gh, &stack.branches, json)?;
+    }
 
     if json {
         return output_json(&SubmitOutput {
             prs_created: created,
             prs_updated: updated,
             branches: branch_infos,
+            dry_run,
         });
+    }
+
+    if dry_run {
+        let default_branch = rt
+            .block_on(gh.client.get_default_branch(gh.owner, gh.repo_name))
+            .context("Failed to get default branch")?;
+        print_dry_run_summary(created, updated, &default_branch, &branch_infos, &stack);
+        return Ok(());
     }
 
     print_summary(created, updated);
@@ -172,7 +194,7 @@ fn process_branches(
         let parent_name = branch.parent.clone();
         let existing_pr = branch.pr;
 
-        if !config.json {
+        if !config.json && !config.dry_run {
             output::info(&format!("Processing {branch_name}..."));
             output::info(&format!("  Pushing {branch_name}..."));
         }
@@ -192,11 +214,13 @@ fn process_branches(
         }
 
         if let Some(pr_number) = existing_pr {
-            update_existing_pr(gh, pr_number, base_branch, config.json)?;
+            if !config.dry_run {
+                update_existing_pr(gh, pr_number, base_branch, config.json)?;
+            }
             updated += 1;
             branch_infos.push(BranchSubmitInfo {
                 branch: branch_name.to_string(),
-                pr_number,
+                pr_number: Some(pr_number),
                 pr_url: Some(format!(
                     "https://github.com/{}/{}/pull/{pr_number}",
                     gh.owner, gh.repo_name
@@ -212,9 +236,10 @@ fn process_branches(
                 body,
                 config.draft,
                 config.json,
+                config.dry_run,
             )?;
 
-            stack.branches[i].pr = Some(result.pr_number);
+            stack.branches[i].pr = result.pr_number;
             let action = if result.was_created {
                 created += 1;
                 SubmitAction::Created
@@ -313,12 +338,13 @@ fn update_existing_pr(
 
 /// Result of creating or finding a PR.
 struct PrResult {
-    pr_number: u64,
+    pr_number: Option<u64>,
     was_created: bool,
     pr_url: Option<String>,
 }
 
 /// Create a new PR or find an existing one.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 fn create_or_find_pr(
     gh: &GitHubContext<'_>,
     branch_name: &str,
@@ -327,6 +353,7 @@ fn create_or_find_pr(
     body: String,
     draft: bool,
     json: bool,
+    dry_run: bool,
 ) -> Result<PrResult> {
     // Check if PR already exists for this branch
     let existing = gh
@@ -338,11 +365,20 @@ fn create_or_find_pr(
         .context("Failed to check for existing PR")?;
 
     if let Some(pr) = existing {
+        // Only update base branch, preserve existing description
+
+        if dry_run {
+            return Ok(PrResult {
+                pr_number: Some(pr.number),
+                was_created: false,
+                pr_url: Some(pr.html_url),
+            });
+        }
+
         if !json {
             output::info(&format!("  Found existing PR #{}...", pr.number));
         }
 
-        // Only update base branch, preserve existing description
         let update = UpdatePullRequest {
             title: None,
             body: None,
@@ -357,16 +393,13 @@ fn create_or_find_pr(
             .with_context(|| format!("Failed to update PR #{}", pr.number))?;
 
         return Ok(PrResult {
-            pr_number: pr.number,
+            pr_number: Some(pr.number),
             was_created: false,
             pr_url: Some(pr.html_url),
         });
     }
 
     // Create new PR
-    if !json {
-        output::info(&format!("  Creating PR ({branch_name} → {base_branch})..."));
-    }
 
     let create = CreatePullRequest {
         title,
@@ -376,20 +409,30 @@ fn create_or_find_pr(
         draft,
     };
 
-    let pr = gh
-        .rt
-        .block_on(gh.client.create_pr(gh.owner, gh.repo_name, create))
-        .with_context(|| format!("Failed to create PR for {branch_name}"))?;
+    let mut pr_result = PrResult {
+        pr_number: None,
+        was_created: true,
+        pr_url: None,
+    };
 
-    if !json {
-        output::success(&format!("  Created PR #{}: {}", pr.number, pr.html_url));
+    if !dry_run {
+        if !json {
+            output::info(&format!("  Creating PR ({branch_name} → {base_branch})..."));
+        }
+
+        let pr = gh
+            .rt
+            .block_on(gh.client.create_pr(gh.owner, gh.repo_name, create))
+            .with_context(|| format!("Failed to create PR for {branch_name}"))?;
+
+        if !json {
+            output::success(&format!("  Created PR #{}: {}", pr.number, pr.html_url));
+        }
+        pr_result.pr_number = Some(pr.number);
+        pr_result.pr_url = Some(pr.html_url);
     }
 
-    Ok(PrResult {
-        pr_number: pr.number,
-        was_created: true,
-        pr_url: Some(pr.html_url),
-    })
+    Ok(pr_result)
 }
 
 /// Print summary of submit operation.
@@ -406,6 +449,62 @@ fn print_summary(created: usize, updated: usize) {
     } else {
         output::info("No changes to submit");
     }
+}
+
+/// Print summary for dy run submit operation.
+fn print_dry_run_summary(
+    created: usize,
+    updated: usize,
+    default_branch: &str,
+    branch_infos: &[BranchSubmitInfo],
+    stack: &rung_core::stack::Stack,
+) {
+    if branch_infos.is_empty() {
+        output::info("No branches to submit");
+    }
+
+    let updated_branches = branch_infos
+        .iter()
+        .filter(|info| matches!(info.action, SubmitAction::Updated))
+        .collect::<Vec<_>>();
+
+    let created_branches = branch_infos
+        .iter()
+        .filter(|info| matches!(info.action, SubmitAction::Created))
+        .collect::<Vec<_>>();
+
+    let mut parts = vec![];
+    if updated > 0 {
+        parts.push(format!("→ Would push {updated} branches:"));
+        for info in updated_branches {
+            parts.push(format!(
+                "  - {} (PR #{})",
+                info.branch,
+                // for a branch with SubmitAction::Updated, we should always have a PR number
+                // in the future maybe BranchSubmitInfo could enforce that invariant
+                // maybe BranchSubmitInfo could be an enum with Created and Updated variants instead of using SubmitAction ?
+                info.pr_number.unwrap_or(0)
+            ));
+        }
+        parts.push(String::new());
+    }
+    if created > 0 {
+        parts.push(format!("→ Would create {created} new PRs for branches:"));
+        for info in created_branches {
+            parts.push(format!(
+                "  - {} → {}",
+                info.branch,
+                stack
+                    .find_branch(&info.branch)
+                    .and_then(|b| b.parent.as_deref())
+                    .unwrap_or(default_branch)
+            ));
+        }
+        parts.push(String::new());
+    }
+
+    parts.push("(dry run - no changes made)".into());
+    output::essential(&parts.join("\n"));
 }
 
 /// Marker to identify rung stack comments.
