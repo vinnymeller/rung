@@ -43,7 +43,7 @@ fn setup_git_repo() -> TempDir {
         .expect("Failed to git add");
 
     StdCommand::new("git")
-        .args(["commit", "-m", "Initial commit"])
+        .args(["commit", "-m", "Initial commit", "--no-gpg-sign"])
         .current_dir(&temp)
         .output()
         .expect("Failed to create initial commit");
@@ -262,7 +262,7 @@ fn test_create_stacked_branches() {
         .expect("Failed to git add");
 
     StdCommand::new("git")
-        .args(["commit", "-m", "Add feature 1"])
+        .args(["commit", "-m", "Add feature 1", "--no-gpg-sign"])
         .current_dir(&temp)
         .output()
         .expect("Failed to commit");
@@ -517,7 +517,7 @@ fn test_log() {
         .expect("Failed to git add");
 
     StdCommand::new("git")
-        .args(["commit", "-m", "Add feature"])
+        .args(["commit", "-m", "Add feature", "--no-gpg-sign"])
         .current_dir(&temp)
         .output()
         .expect("Failed to commit");
